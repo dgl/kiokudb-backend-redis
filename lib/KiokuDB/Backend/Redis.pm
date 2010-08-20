@@ -1,14 +1,30 @@
-package KiokuDB::Backend::Redis;
+package KiokuDB::Backend::Redis; # ex:sw=4 et:
 use Moose;
 
-use Carp qw(croak);
-use Redis;
+use AnyEvent::Redis;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
-has '_redis' => (
+has host => (
+    is => 'ro',
+    isa => 'Str',
+);
+
+has port => (
+    is => 'ro',
+    isa => 'Int',
+);
+
+has prefix => (
+    is => 'ro',
+    isa => 'Str',
+    default => "",
+);
+
+has 'redis' => (
     is => 'rw',
-    isa => 'Redis'
+    isa => 'AnyEvent::Redis',
+    lazy_build => 1
 );
 
 with qw(
@@ -16,89 +32,120 @@ with qw(
     KiokuDB::Backend::Serialize::Delegate
 );
 
+use namespace::clean -except => 'meta';
+
 sub new_from_dsn_params {
-    my ( $self, %args ) = @_;
+    my($self, %args) = @_;
 
-    $args{debug} = 1;
+    if(delete($args{server}) =~ /^(.*?)(?::(\d+))?$/) {
+        $args{host} ||= $1;
+        $args{port} ||= $2;
+    }
 
-    $self->new(_redis => Redis->new(%args));
+    $self->new(%args);
+}
+
+sub BUILD { shift->redis }
+
+sub _build_redis {
+    my($self)  = @_;
+
+    AnyEvent::Redis->new(host => $self->host, port => $self->port);
 }
 
 sub delete {
     my ($self, @ids_or_entries) = @_;
 
-    my $redis = $self->_redis;
+    my $redis = $self->redis;
 
     my @uids = map { ref($_) ? $_->id : $_ } @ids_or_entries;
 
+    my $cv = AE::cv;
     foreach my $id ( @uids ) {
-
-        $redis->del($id);
-        # TODO Error checking
+        $cv->begin;
+        $redis->del($id, sub { $cv->end });
     }
+
+    # TODO Error checking
+    $cv->recv;
 
     return;
 }
 
 sub exists {
     my ($self, @ids) = @_;
+    warn "Exists: @ids";
 
     my @exists;
 
-    my $redis = $self->_redis;
-    foreach my $id (@ids) {
+    my $redis = $self->redis;
 
-        if($redis->exists($id)) {
-            push(@exists, 1);
-        } else {
-            push(@exists, 0);
-        }
+    my $cv = AE::cv;
+    my $i = 0;
+    foreach my $id (@ids) {
+        $cv->begin;
+
+        # Copy for closure
+        my $count = $i;
+        $redis->exists($self->{prefix} . $id->id, sub {
+                $exists[$count] = $_[1];
+                $cv->end;
+            }
+        );
+
+        $i++;
     }
+
     # TODO Error checking
+    $cv->recv;
+
     return @exists;
 }
 
 sub insert {
     my ($self, @entries) = @_;
+    return unless @entries;
 
-    my $redis = $self->_redis;
+    my $redis = $self->redis;
 
-    my @exists = $self->exists(@entries);
+    my(@new, @update);
 
     foreach my $entry ( @entries ) {
-
         if($entry->has_prev) {
-            my $ret = $redis->set(
-                $entry->id => $self->serialize($entry),
-            );
-            # TODO Error checking
+            push @update, $entry;
         } else {
-            my $ret = $redis->setnx(
-                $entry->id => $self->serialize($entry),
-            );
-            # TODO Error checking
+            push @new, $entry;
         }
     }
+
+    my $cv = AE::cv;
+
+    if(@new) {
+        $cv->begin;
+        $redis->msetnx(map(($self->{prefix} . $_->id => $self->serialize($_)), @new),
+            sub { $cv->end });
+    }
+
+    if(@update) {
+        $cv->begin;
+        $redis->mset(map(($self->{prefix} . $_->id => $self->serialize($_)), @new),
+            sub { $cv->end });
+    }
+
+    $cv->recv;
 }
 
 sub get {
     my ($self, @ids) = @_;
+    warn "Get @ids";
 
-    my ( $var, @ret );
+    my @ret;
+    $self->redis->mget(map { $self->{prefix} . $_ } @ids, sub {
+            # TODO Error checking
+            @ret = map $self->deserialize($_), @ids[1 .. $#ids]
+        });
 
-    my $redis = $self->_redis;
-
-    foreach my $id ( @ids ) {
-        my $val = $redis->get($id);
-        # TODO Error checking
-        if(defined($val)) {
-            push @ret, $val;
-        } else {
-            return;
-        }
-    }
-
-    return map { $self->deserialize($_) } @ret;
+    return @ret;
 }
 
 1;

@@ -7,7 +7,7 @@ license  'perl';
 
 build_requires 'Test::More';
 
-requires 'Redis' => '0.0801';
+requires 'AnyEvent::Redis' => '0.11';
 requires 'KiokuDB' => '0.32';
 
 WriteAll;

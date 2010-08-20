@@ -1,5 +1,8 @@
 Revision history for KiokuDB-Backend-Redis
 
+0.03  Fri Aug 20 18:59:53 BST 2010
+    Switch to AnyEvent::Redis
+
 0.02
     Test improvements
 
